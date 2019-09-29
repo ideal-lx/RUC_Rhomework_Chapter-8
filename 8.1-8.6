@@ -1,0 +1,269 @@
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(highcharter)
+library(tidyquant)
+library(timetk)
+library(tibbletime)
+library(quantmod)
+library(PerformanceAnalytics)
+library(scales)
+library(magrittr)
+library(highcharter)
+library(tidyquant)
+library(timetk)
+library(broom)
+
+
+w <- c(0.25,
+       0.25,
+       0.20,
+       0.20,
+       0.10)
+
+#投资组合中5项资产的报价人代号
+symbols <- c("SPY","EFA", "IJS", "EEM","AGG")
+
+#输入SPY的价格，计算月回报率，保存为market_returns_tidy
+market_returns_xts <-
+  getSymbols("SPY",
+             src = 'yahoo',
+             from = "2012-12-31",
+             to = "2017-12-31",
+             auto.assign = TRUE,
+             warnings = FALSE) %>%
+  map(~Ad(get(.))) %>%
+  reduce(merge) %>%
+  `colnames<-`("SPY") %>%
+  to.monthly(indexAt = "lastof",
+             OHLC = FALSE) %>%
+  Return.calculate(.,
+                   method = "log") %>%
+  na.omit()
+
+#使用tidyverse时，需要市场回报的tibble变量
+#tibble：用来替换data.frame类型的扩展的数据框，与data.frame有相同的语法，使用起来更方便
+market_returns_tidy <-
+  market_returns_xts %>%
+  tk_tbl(preserve_index = TRUE,
+         rename_index = "date") %>%
+  na.omit() %>%
+  select(date, returns = SPY)
+
+########前期准备{
+
+#从指定的数据库中导入五个ETFs的价格数据，储存在prices的xts对象中
+prices <-
+  read_excel("/Users/lixiang/Desktop/Reproducible Finance.xlsx",
+             col_types = c("text", "numeric",
+                           "numeric", "numeric",
+                           "numeric", "numeric")) %>%
+  mutate(date = ymd(date)) %>%  #将时间变量列加入xts中
+  tk_xts(date_var = date)
+
+
+asset_returns_dplyr_byhand <-
+  prices %>%
+  to.monthly(indexAt = "lastof", OHLC = FALSE) %>%
+  # convert the index to a date
+  data.frame(date = index(.)) %>%
+  # now remove the index because it got converted to row names
+  remove_rownames() %>%
+  gather(asset, prices, -date) %>%
+  group_by(asset) %>%
+  mutate(returns = (log(prices) - log(lag(prices)))) %>%
+  select(-prices) %>%
+  spread(asset, returns) %>%
+  select(date, symbols)
+
+asset_returns_dplyr_byhand <-
+  asset_returns_dplyr_byhand %>%
+  na.omit()
+
+asset_returns_long <-
+  asset_returns_dplyr_byhand %>%
+  gather(asset, returns, -date) %>%
+  group_by(asset)
+
+portfolio_returns_tq_rebalanced_monthly <-
+  asset_returns_long %>%
+  tq_portfolio(assets_col = asset,
+               returns_col = returns,
+               weights = w,
+               col_rename = "returns",
+               rebalance_on = "months")
+    
+##############}
+
+portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_returns = market_returns_tidy$returns) %>%
+  head()
+
+#################前期准备{
+prices_monthly <- to.monthly(prices,
+                             indexAt = "lastof",
+                             OHLC = FALSE)
+asset_returns_xts <-
+  Return.calculate(prices_monthly,
+                   method = "log") %>%
+  na.omit()
+
+portfolio_returns_xts_rebalanced_monthly <-
+  Return.portfolio(asset_returns_xts,
+                   weights = w,
+                   rebalance_on = "months") %>%
+  `colnames<-`("returns")
+
+######################}
+
+cov(portfolio_returns_xts_rebalanced_monthly,
+    market_returns_tidy$returns)/
+  var(market_returns_tidy$returns)
+
+beta_assets <-
+  asset_returns_long %>%
+  nest(-asset)
+beta_assets
+
+beta_assets <-
+  asset_returns_long %>%
+  nest(-asset) %>%
+  mutate(model =
+           map(data, ~
+                 lm(returns ~ market_returns_tidy$returns,
+                    data = .)))  #map:将后面的值返回
+beta_assets
+beta_assets$data
+beta_assets$model #展开结果
+
+
+beta_assets <-
+  asset_returns_long %>%
+  nest(-asset) %>%
+  mutate(model =
+           map(data, ~
+                 lm(returns ~ market_returns_tidy$returns,
+                    data = .))) %>%
+  mutate(model = map(model, tidy))  #mutate:在后面加一列
+beta_assets
+
+beta_assets <-
+  asset_returns_long %>%
+  nest(-asset) %>%
+  mutate(model =
+           map(data, ~
+                 lm(returns ~ market_returns_tidy$returns,
+                    data = .))) %>%
+  mutate(model = map(model, tidy)) %>%
+  unnest(model) %>%
+  mutate_if(is.numeric, funs(round(., 4)))
+beta_assets
+
+beta_assets <-
+  asset_returns_long %>%
+  nest(-asset) %>%
+  mutate(model =
+           map(data, ~
+                 lm(returns ~ market_returns_tidy$returns,
+                    data = .))) %>%
+  mutate(model = map(model, tidy)) %>%
+  unnest(model) %>%
+  filter(term != "(Intercept)") %>%
+  select(-term)
+beta_assets
+
+beta_assets %>%
+  select(asset, estimate) %>%
+  filter(asset == "SPY")
+
+beta_byhand <-
+  w[1] * beta_assets$estimate[1] +
+  w[2] * beta_assets$estimate[2] +
+  w[3] * beta_assets$estimate[3] +
+  w[4] * beta_assets$estimate[4] +
+  w[5] * beta_assets$estimate[5]
+beta_byhand
+
+
+beta_builtin_xts <-
+  CAPM.beta(portfolio_returns_xts_rebalanced_monthly,
+            market_returns_xts)
+
+#8.4
+beta_dplyr_byhand <-
+  portfolio_returns_tq_rebalanced_monthly %>%
+  do(model =
+       lm(returns ~ market_returns_tidy$returns,
+          data = .)) %>%
+  tidy(model) %>%
+  mutate(term = c("alpha", "beta")) %>%
+  select(estimate)
+beta_dplyr_byhand$estimate[2]
+
+#8.5
+beta_builtin_tq <-
+  portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_return =
+           market_returns_tidy$returns) %>%
+  na.omit() %>%
+  tq_performance(Ra = returns,
+                 Rb = market_return,
+                 performance_fun = CAPM.beta) %>%
+  `colnames<-`("beta_tq")
+  
+beta_builtin_tq %>%
+  mutate(dplyr_beta = beta_dplyr_byhand$estimate[2],
+         byhand_beta = beta_byhand,
+         xts_beta = coredata(beta_builtin_xts)) %>%
+  round(3)
+
+#8.6
+portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_returns =
+           market_returns_tidy$returns) %>%
+  ggplot(aes(x = market_returns,
+             y = returns)) +
+  geom_point(color = "cornflowerblue") +
+  ylab("portfolio returns") +
+  xlab("market returns")
+
+portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_returns =
+           market_returns_tidy$returns) %>%
+  ggplot(aes(x = market_returns,
+             y = returns)) +
+  geom_point(color = "cornflowerblue") +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "green") +
+  ylab("portfolio returns") +
+  xlab("market returns")
+
+portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_returns = market_returns_tidy$returns) %>%
+  ggplot(aes(x = market_returns, y = returns)) +
+  geom_point(color = "cornflowerblue") +
+  geom_abline(aes(
+    intercept = beta_dplyr_byhand$estimate[1],
+    slope = beta_dplyr_byhand$estimate[2]),
+    color = "purple") +
+  ylab("portfolio returns") +
+  xlab("market returns")
+
+portfolio_returns_tq_rebalanced_monthly %>%
+  mutate(market_returns =
+           market_returns_tidy$returns) %>%
+  ggplot(aes(x = market_returns,
+             y = returns)) +
+  geom_point(color = "cornflowerblue") +
+  geom_abline(
+    aes(intercept =
+          beta_dplyr_byhand$estimate[1],
+        slope = beta_dplyr_byhand$estimate[2]),
+    color = "purple") +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "green") +
+  ylab("portfolio returns") +
+  xlab("market returns")
+
